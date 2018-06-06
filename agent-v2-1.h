@@ -1,0 +1,1677 @@
+//
+// Created by FeiChenyi on 5/28/18.
+//
+
+#ifndef BIOFILM_AGENT_AGENT_V2_H
+#define BIOFILM_AGENT_AGENT_V2_H
+
+// *** 1. Headers *** //
+#include <iostream>
+#include <complex>
+#include <fstream>
+#include <string>
+#include <math.h>
+#include <random>
+#include <iomanip>
+#include <cmath>
+#include <map>
+#include <sys/stat.h>
+#include <vector>
+#include <numeric>
+#include <gsl/gsl_math.h>
+#include <gsl/gsl_multimin.h>
+#include <gsl/gsl_vector.h>
+#include <gsl/gsl_errno.h>
+#include <gsl/gsl_matrix.h>
+#include <gsl/gsl_odeiv.h>
+#include <gsl/gsl_rng.h>
+using namespace std;
+// Note: pi is given by M_PI
+// *************************** //
+
+
+
+// *** 2. Model Parameters *** //
+// Length, Force, Time Unit:
+const double R = 1; // spherocylinder radius
+const double E_0 = 1 * R * R; // elastic modulus of the cell
+const double A = 1;	// growth rate
+
+// Cell-cell and cell-surface interaction parameters:
+double A_0 = 10. * E_0 * R /100.0; 	// cell-cell adhesion energy, equals to PI*gamma_12
+const double Fc_JKR = 3 * A_0 * R /4.; // critical force of JKR model
+const double dc_JKR = pow(3.*R/4.,1./3.)*pow(A_0/15.0/E_0,2./3.); //critical separation of JKR model
+// const double A_0 = 0;
+double Fr0 = E_0 * R * R; //test repulsive force
+double wFr = 0.5 * R; // repulsive potential width
+double E_1 = 1 * E_0;  	// the elastic modulus of cell-surface interaction (cylindrical term)
+double A_1 = E_1 * R / 1000.0; 	// cell-surface adhesion energy (cylindrical term)
+const double E_2 = E_1;			// the elastic modulus of cell-surface interaction (spherical term)
+double A_2 = A_1;			// cell-surface adhesion energy (spherical term)
+
+// Viscosity parameters:
+double NU_1 = 0.1 * (E_0) / 1; // surface drag coefficient
+double NU_0 = NU_1 / 100; // ambient (positional) drag
+
+// Additional cell parameters:
+const double Adev  = 0.2 * A; // growth rate noise
+const double L0 = 1 * R; // initial length of the first cell
+double Lf = 4 * R; // mean final length
+
+// Solver parameters:
+const double DOF_GROW = 7; // degrees of freedom (growing cell)
+const int MAX_DOF = 5000; // Total allowed degrees of freedom. N * DOF_GROW must be less than MAX_DOF, else segfault!
+
+const double noise_level = 1e-6; // A small, symmetry breaking noise is chosen from a distribution of this width
+// and added to the generalized forces at each step during the evolution.
+const double h0 = 1e-4; // absolute accuracy of diff. eq. solver
+const double TIME_EPS = 1e-4*h0;
+
+// Time evolution parameters and output:
+const double T = 5.5; // Integrate for this amount of total time.
+const double tstep = 0.05; // for output purposes only. Outputs data after every interval of time "tstep"
+string my_name; // output folder + file name
+string my_cd;   // out put directory
+
+// Other parameters:
+const double xy = 1; // Confine to xy plane?
+const double xz = 0; // Confine to xz plane?
+
+// Random number generation:
+std::random_device rd;
+std::default_random_engine generator(rd());
+std::normal_distribution<double> normal(0, Adev); // for cell growth
+
+// *************************** //
+
+
+// *** 3. Customized Structure and Function *** //
+// Structure:
+struct overlapVec {
+    // For two contacting cells, this struct specifies the locations of the points along
+    // the cell centerlines that are separated by the smallest distance.
+    // The distance is given by "overlap."
+    double rix1, riy1, riz1;
+    double rix2, riy2, riz2;
+    double dist;
+};
+
+struct myVec {
+    // Vector
+    double x, y, z;
+};
+
+struct my6Vec {
+    // Cell center-of-mass position (x, y, z) and orientation (nx, ny, nz)
+    // Generalized force (Fx, Fy, Fz) adn torque (nx, ny, nz)
+    double x, y, z, nx, ny, nz;
+};
+
+struct derivFunc{
+    // This struct is used when numerically integrating the equation of motion
+    // to store the generalized forces acting on the cell coordinates
+    double xd, yd, zd, nxd, nyd, nzd;
+};
+
+struct pop_info {
+    // When tracking the verticalization of a cell,
+    // this struct is used to store the orientation and
+    // cell-to-cell contact forces provided by neighboring cells
+    double vx, vy, vz;
+    double fx, fy, fz;
+    double nz;
+};
+
+// Function:
+double cot(double i) { return(1 / tan(i)); } // Cotangent function
+double csc(double i) { return(1 / sin(i)); } // Cosecant function
+
+double cross(double x1, double y1, double z1, double x2, double y2, double z2, int dof) {
+    // Cross product of r1 = (x1, y1, z1) and r2 (x2, y2, z2).
+    // Returns the degree of freedom "dof" of the vector r1 x r2
+    if (dof == 0) {
+        return -(y2*z1) + y1*z2;
+    } else if (dof == 1) {
+        return x2*z1 - x1*z2;
+    } else if (dof == 2) {
+        return -(x2*y1) + x1*y2;
+    }
+    return 0;
+}
+
+double vnorm(double x, double y, double z) {
+    // Return the magnitude of a vector (x, y, z)
+    return sqrt(x*x + y*y + z*z);
+}
+// *************************** //
+
+
+// *** 4. Class of a Cell (ESSENTIAL)*** //
+class Cell {
+    // One cell. Stores the coordinates and creates daughter cells when time to divide
+private:
+    double x, y, z, nx, ny, nz, l, Lfi, ai; //position, orientation, current length, final length, growth rate
+    double tborn;
+    string lineage;
+    double current_nz;
+    int current_sa;  // surface attached ?
+    int confine;
+
+    double dx, dy, dz, dnx, dny, dnz; // random perturbation
+
+    vector<pop_info> pop_vec;
+    vector<int> ContactList;
+public:
+
+
+    Cell (double, double, double, double, double, double, double);
+    void set_pos(double mx, double my, double mz) {
+        x = mx;
+        y = my;
+        z = mz;
+    }
+    void set_n(double mnx, double mny, double mnz) {
+        nx = mnx;
+        ny = mny;
+        nz = mnz;
+    }
+    void set_l(double ml) {
+        l = ml;
+    }
+    void set_confine() { confine = 1; }
+    void set_ai(double mai) { ai = mai; }
+    void set_x(double mx) { x = mx; }
+    void set_y(double mx) { y = mx; }
+    void set_z(double mx) { z = mx; }
+    void set_nx(double mx) { nx = mx; }
+    void set_ny(double mx) { ny = mx; }
+    void set_nz(double mx) { nz = mx; }
+
+    void set_noise() {
+        dx = noise_level * (rand()/(static_cast<double>(RAND_MAX)) - 0.5);
+        dy = noise_level * (rand()/(static_cast<double>(RAND_MAX)) - 0.5);
+        dz = noise_level * (rand()/(static_cast<double>(RAND_MAX)) - 0.5);
+        dnx = noise_level * (rand()/(static_cast<double>(RAND_MAX)) - 0.5);
+        dny = noise_level * (rand()/(static_cast<double>(RAND_MAX)) - 0.5);
+        dnz = noise_level * (rand()/(static_cast<double>(RAND_MAX)) - 0.5);
+    }
+    void set_tborn(double ti) {
+        tborn = ti;
+    }
+    void set_lin(string xb) {
+        lineage = lineage + xb;
+    }
+
+    void set_current_nz(double mz) {
+        current_nz = mz;
+    }
+    void set_current_sa(int sa) { current_sa = sa; }
+
+    void add_pop_vec(pop_info pi) {
+        pop_vec.push_back(pi);
+    }
+    void clear_pop_vec() {
+        pop_vec.clear();
+    }
+    int get_pop_contact() {
+        return pop_vec.size();
+    }
+    double get_pop_vx(int i) {
+        return pop_vec[i].vx;
+    }
+    double get_pop_vy(int i) {
+        return pop_vec[i].vy;
+    }
+    double get_pop_vz(int i) {
+        return pop_vec[i].vz;
+    }
+    double get_pop_fx(int i) {
+        return pop_vec[i].fx;
+    }
+    double get_pop_fy(int i) {
+        return pop_vec[i].fy;
+    }
+    double get_pop_fz(int i) {
+        return pop_vec[i].fz;
+    }
+    double get_pop_nz(int i) {
+        return pop_vec[i].nz;
+    }
+
+    my6Vec get_noise() {
+        my6Vec noise;
+        noise.x = dx;
+        noise.y = dy;
+        noise.z = dz;
+        noise.nx = dnx;
+        noise.ny = dny;
+        noise.nz = dnz;
+        return noise;
+    }
+
+    // Return the state of the cell
+    double get_x() { return x; }
+    double get_y() { return y; }
+    double get_z() { return z; }
+    double get_nx() { return nx; }
+    double get_ny() { return ny; }
+    double get_nz() { return nz; }
+    double get_l() { return l; }
+    double get_Lf() { return Lfi; }
+    double get_ai() { return ai; }
+    double get_tborn() { return tborn; }
+    string get_lin() { return lineage; }
+    double get_current_nz() { return current_nz; }
+    int get_current_sa() { return current_sa; }
+    int get_confine() { return confine; }
+
+    // functions related to Contactlist
+    int is_in_contactlist(int j);
+    void add_contactlist(int j){ContactList.push_back(j);}
+    int get_size_contactlist() {return ContactList.size();}
+    int get_contactlist_ele(int i) {return ContactList[i];}
+    void erase_contactlist_ele(int i) {ContactList.erase(ContactList.begin()+i);}
+    int replace_contactlist_ele(int i,int j);
+};
+
+Cell::Cell(double mx, double my, double mz, double mnx, double mny, double mnz, double ml) {
+    x = mx;
+    y = my;
+    z = mz;
+    nx = mnx;
+    ny = mny;
+    nz = mnz;
+    l = ml;   // the seven degrees of freedom of the cell
+
+    current_nz = nz;
+    Lfi = Lf;
+    confine = 0;
+    lineage = "";
+    ContactList.clear();
+
+    set_noise();    // initialize noise level
+    ai = A + normal(generator); // set random growth rate
+}
+
+int Cell::is_in_contactlist(int j) {
+    if(ContactList.empty())
+    {
+        return 0;
+    }
+    else {
+        for (int i = 0; i < ContactList.size(); i++) {
+            if (j == ContactList[i]) { return 1; }
+        }
+        return 0;
+    }
+}
+
+int Cell::replace_contactlist_ele(int i, int j) {
+    if(ContactList.empty())
+    {
+        return 0;
+    }
+    else {
+        for (int k = 0; k < ContactList.size(); k++) {
+            if (i == ContactList[k]) { ContactList[k] = j; return 1; }
+        }
+        return 0;
+    }
+}
+
+vector<Cell *> cells;
+// *************************** //
+
+
+// *** 5. Essential Functions *** //
+
+overlapVec get_overlap_Struct(Cell* cell_1, Cell* cell_2) {
+    // Returns the vector of the shortest distance from cell 1 to cell 2
+    // An extension of: http://homepage.univie.ac.at/franz.vesely/notes/hard_sticks/hst/hst.html
+    // dof is the component of the vector (0,1,2 for cell 1, 3,4,5 for cell 2)
+
+    overlapVec answer;
+
+    double x1, y1, z1, nx1, ny1, nz1, l1;
+    double x2, y2, z2, nx2, ny2, nz2, l2;
+    double x12, y12, z12, u1, u2, u12, cc, xla, xmu;
+
+    double h1, h2, gam, gam1, gam2, gamm, gamms, del, del1, del2, delm, delms, aa, a1, a2, risq, f1, f2;
+    double gc1, dc1, gc2, dc2;
+
+    x1 = cell_1->get_x();
+    y1 = cell_1->get_y();
+    z1 = cell_1->get_z();
+    nx1 = cell_1->get_nx();
+    ny1 = cell_1->get_ny();
+    nz1 = cell_1->get_nz();
+    l1 = cell_1->get_l() / 2.0;
+
+    x2 = cell_2->get_x();
+    y2 = cell_2->get_y();
+    z2 = cell_2->get_z();
+    nx2 = cell_2->get_nx();
+    ny2 = cell_2->get_ny();
+    nz2 = cell_2->get_nz();
+    l2 = cell_2->get_l() / 2.0;
+
+    // r_12 = r_2 - r_1;
+    x12 = x2 - x1;
+    y12 = y2 - y1;
+    z12 = z2 - z1;
+
+
+    u1 = x12*nx1 + y12*ny1 + z12*nz1; // u_1 = dot(r_12 , n_1)
+    u2 = x12*nx2 + y12*ny2 + z12*nz2; // u_2 = dot(r_12 , n_2)
+    u12 = nx1*nx2 + ny1*ny2 + nz1*nz2; // u_12 = dot(n_1, n_2)
+    cc = 1.0 - u12*u12;
+
+    // Check if parallel
+    if (cc < 1e-6) {
+        if(u1 && u2) {
+            xla = u1/2;
+            xmu = -u2/2;
+        }
+        else {
+            // lines are parallel
+
+            answer.rix1 = x1;
+            answer.riy1 = y1;
+            answer.riz1 = z1;
+            answer.rix2 = x2;
+            answer.riy2 = y2;
+            answer.riz2 = z2;
+            answer.dist = sqrt(pow(answer.rix1 - answer.rix2,2)+pow(answer.riy1 - answer.riy2,2)+pow(answer.riz1 - answer.riz2,2));
+
+            return answer;
+        }
+    }
+    else {
+        xla = (u1 - u12*u2) / cc;
+        xmu = (-u2 + u12*u1) / cc;
+    }
+
+    //Rectangle half lengths h1=L1/2, h2=L2/2
+    h1 = l1;
+    h2 = l2;
+
+    //If the origin is contained in the rectangle,
+    //life is easy: the origin is the minimum, and
+    //the in-plane distance is zero!
+    if ((xla*xla <= h1*h1) && (xmu*xmu <= h2*h2)) {
+        answer.rix1 = x1 + (xla) * nx1;
+        answer.riy1 = y1 + (xla) * ny1;
+        answer.riz1 = z1 + (xla) * nz1;
+        answer.rix2 = x2 + (xmu) * nx2;
+        answer.riy2 = y2 + (xmu) * ny2;
+        answer.riz2 = z2 + (xmu) * nz2;
+        answer.dist = sqrt(pow(answer.rix1 - answer.rix2,2)+pow(answer.riy1 - answer.riy2,2)+pow(answer.riz1 - answer.riz2,2));
+
+        return answer;
+    }
+    else {
+        //Find minimum of f=gamma^2+delta^2-2*gamma*delta*(e1*e2)
+        //where gamma, delta are the line parameters reckoned from the intersection
+        //(=lam0,mu0)
+
+        //First, find the lines gamm and delm that are nearest to the origin:
+        gam1 = -xla - h1;
+        gam2 = -xla + h1;
+        gamm = gam1;
+        if (gam1*gam1 > gam2*gam2) { gamm=gam2; }
+        del1 = -xmu - h2;
+        del2 = -xmu + h2;
+        delm = del1;
+        if (del1*del1 > del2*del2) { delm = del2; }
+
+        //Now choose the line gamma=gamm and optimize delta:
+        gam = gamm;
+        delms = gam * u12;
+        aa = xmu + delms;	// look if delms is within [-xmu0+/-L/2]:
+        if (aa*aa <= h2*h2) {
+            del=delms;
+        }		// somewhere along the side gam=gamm
+        else {
+            //delms out of range --> corner next to delms!
+            del = del1;
+            a1 = delms - del1;
+            a2 = delms - del2;
+            if (a1*a1 > a2*a2) {del = del2; }
+        }
+
+        // Distance at these gam, del:
+        f1 = gam*gam+del*del-2.*gam*del*u12;
+        gc1 = gam;
+        dc1 = del;
+
+        //Now choose the line delta=deltam and optimize gamma:
+        del=delm;
+        gamms=del*u12;
+        aa=xla+gamms;	// look if gamms is within [-xla0+/-L/2]:
+        if (aa*aa <= h1*h1) {
+            gam=gamms; }		// somewhere along the side gam=gamm
+        else {
+            // gamms out of range --> corner next to gamms!
+            gam=gam1;
+            a1=gamms-gam1;
+            a2=gamms-gam2;
+            if (a1*a1 > a2*a2) gam=gam2;
+        }
+        // Distance at these gam, del:
+        f2 = gam*gam+del*del-2.*gam*del*u12;
+        gc2 = gam;
+        dc2 = del;
+
+        // Compare f1 and f2 to find risq:
+        risq=f1;
+        answer.rix1 = x1 + (xla + gc1) * nx1;
+        answer.riy1 = y1 + (xla + gc1) * ny1;
+        answer.riz1 = z1 + (xla + gc1) * nz1;
+        answer.rix2 = x2 + (xmu + dc1) * nx2;
+        answer.riy2 = y2 + (xmu + dc1) * ny2;
+        answer.riz2 = z2 + (xmu + dc1) * nz2;
+
+        if(f2 < f1) {
+            risq=f2;
+            answer.rix1 = x1 + (xla + gc2) * nx1;
+            answer.riy1 = y1 + (xla + gc2) * ny1;
+            answer.riz1 = z1 + (xla + gc2) * nz1;
+            answer.rix2 = x2 + (xmu + dc2) * nx2;
+            answer.riy2 = y2 + (xmu + dc2) * ny2;
+            answer.riz2 = z2 + (xmu + dc2) * nz2;
+
+        }
+    }
+    answer.dist = sqrt(pow(answer.rix1 - answer.rix2,2)+pow(answer.riy1 - answer.riy2,2)+pow(answer.riz1 - answer.riz2,2));
+    return answer;
+}
+
+int cell_cell_contact(int i, int j){
+    // determine if the cell i and j are attached
+    if (cells[i]->is_in_contactlist(j) != cells[j]->is_in_contactlist(i))
+    {
+        cout<< "Error from cell_cell_contact: incorrect contactlist!" <<endl;
+    }
+    if(cells[i]->is_in_contactlist(j))
+    { return 1;}else{return 0;}
+}
+
+my6Vec cell_cell_gforce(int i, int j) {
+    // This function returns the forces acting on cell "i" due to contact with cell "j"
+
+    my6Vec F;
+    overlapVec nij;
+    nij = get_overlap_Struct(cells[i], cells[j]);
+
+    double rinx = cells[i]->get_nx();
+    double riny = cells[i]->get_ny();
+    double rinz = cells[i]->get_nz();
+
+    double vx, vy, vz;
+    vx = nij.rix1 - cells[i]->get_x();
+    vy = nij.riy1 - cells[i]->get_y();
+    vz = nij.riz1 - cells[i]->get_z();
+
+
+    double check; // This constant determines the direction of the coordinate "s",
+    // which gives the distance along the cell cylinder line from the cell center-of-mass.
+
+    // In this function the local variable ai denotes the sign function related
+    // to the orientation vector. It is chosen such that the cell always points
+    // from the center to the nearest contact point
+
+    double ai = 1;
+    check = rinx * vx + riny * vy + rinz * vz;
+    if (check < 0) {
+        ai = -1;
+    }
+
+    // Intermediate values that are used to calculate the cell-to-cell contact force.
+    // ac and bc are the same as xlam and xmu in the function "get_overlap_Struct",
+    // which stand for the coordinates of nearest points on the centerline.
+    double ac = sqrt(vx*vx + vy*vy + vz*vz);
+
+    double qij2 = pow(nij.dist,2);
+    double overlap = 2*R - nij.dist;
+
+    double QT;
+    string typei = cells[i] -> get_lin();
+    string typej = cells[j] -> get_lin();
+
+    if (typei[1] == 'W' and typej[1] == 'W') // at least one cell is WT. use JKR model
+    {
+        QT = - Fc_JKR * (-1 + 0.12*pow(1.+overlap/dc_JKR,5./3.)) / sqrt(qij2);
+    }
+    else{ // both cells are RbmA mutants. use Hertzian model
+
+        QT = - 5*E_0*pow(R,0.5)*pow(-pow(qij2,0.16666666666666666) +
+                                                       (2*R)/pow(qij2,0.3333333333333333),1.5);
+    }
+
+
+    F.x = 0;
+    F.y = 0;
+    F.z = 0;
+    F.nx = 0;
+    F.ny = 0;
+    F.nz = 0;
+
+
+
+    // Check if the cells are overlapping and that their locations do not perfectly coincide
+    // These checks are redudant due to small, numerical errors in the function that calculates overlap.
+//    if ( overlap > 0 and sqrt(qij2) > 0 and sqrt(qij2) < 2*R and pow(-sqrt(qij2) + 2*R,1.5) > 0) {
+    if ( cell_cell_contact(i,j) == 1  and (-pow(qij2,0.16666666666666666) + (2*R)/pow(qij2,0.3333333333333333) > 0.) ) {
+
+        if (isnan(QT)) {cout << "NaN Error in cell-cell-gforce" << endl;}
+
+        //checked F.x, F.y, F.z
+        F.x = (QT*(nij.rix1 - nij.rix2))/2.;
+        F.y = (QT*(nij.riy1 - nij.riy2))/2.;
+        F.z = (QT*(nij.riz1 - nij.riz2))/2.;
+        //
+        F.nx = (ac*ai*QT*(nij.rix1 - nij.rix2))/2.;
+        F.ny = (ac*ai*QT*(nij.riy1 - nij.riy2))/2.;
+        F.nz = (ac*ai*QT*(nij.riz1 - nij.riz2))/2.;
+
+//        if (typei[1] == 'W' and typej[1] == 'W')
+//        {
+//            cout<< "current overlap:" << overlap << "; current force: " << sqrt(F.x*F.x + F.y*F.y)<<endl;
+//        }
+
+    } else if ( nij.dist == 0 ) {
+        cout << "Error 1. cells are on top of each other in gforce." << endl;
+    } else {
+        //cout << "Error 2. cells are ? in gforce." << endl;
+    }
+
+    QT = 0.;
+    if (typei[1] == 'A' or typej[1] == 'A')
+        QT = - Fr0*exp(- 0.5 * qij2 / wFr / wFr);
+
+    F.x += (QT*(nij.rix1 - nij.rix2))/2.;
+    F.y += (QT*(nij.riy1 - nij.riy2))/2.;
+    F.z += (QT*(nij.riz1 - nij.riz2))/2.;
+    //
+    F.nx += (ac*ai*QT*(nij.rix1 - nij.rix2))/2.;
+    F.ny += (ac*ai*QT*(nij.riy1 - nij.riy2))/2.;
+    F.nz += (ac*ai*QT*(nij.riz1 - nij.riz2))/2.;
+
+    // Correct the sign.
+    F.x = -F.x;
+    F.y = -F.y;
+    F.z = -F.z;
+    F.nx = -F.nx;
+    F.ny = -F.ny;
+    F.nz = -F.nz;
+
+    return F;
+}
+
+my6Vec cell_surface_gforce(Cell* cell_1) {
+    // Return the surface torque acting on cell 1
+
+    double t;
+
+//    double rix = cell_1->get_x();
+//    double riy = cell_1->get_y();
+    double riz = cell_1->get_z();
+//    double rinx = cell_1->get_nx();
+//    double riny = cell_1->get_ny();
+    double rinz = cell_1->get_nz();
+
+    double nzi = cell_1->get_nz();
+
+    double check = 1;
+
+    double l = cell_1->get_l();
+    double z = cell_1->get_z();
+
+
+    // note: rinz is pointing upwards, but nzi could be either positive or negative
+    if (rinz < 0) {
+        rinz = -rinz;
+        check = -1;
+    }
+
+    if (nzi < -1) {
+        nzi = -1;
+    }
+    if (nzi > 1) {
+        nzi = 1;
+    }
+
+    if (nzi > 0) {
+        t = asin(nzi);
+    } else {
+        t = asin(-nzi);
+    }
+
+    if (rinz < -1) {
+        rinz = -1;
+    }
+    if (rinz > 1) {
+        rinz = 1;
+    }
+
+    double h1 = z + l*nzi/2.0;
+    double h2 = z - l*nzi/2.0;
+
+    // *** note: h1 records the z coordinate of the lower end of the cell
+    if (h1 > h2) {
+        h1 = h2;
+    }
+
+    my6Vec F;
+    F.x = 0;
+    F.y = 0;
+    F.z = 0;
+    F.nx = 0;
+    F.ny = 0;
+    F.nz = 0;
+
+    if (h1 > R) {
+        // No contact
+    } else if (h1 > (R - l*sin(t))) {
+        // Partial contact
+        F.z -= (A_2*M_PI*rinz)*R - (4*E_2*sqrt(R)*rinz*pow(R + (l*rinz)/2. - riz,1.5))/3. -
+               (E_1*(1 - pow(rinz,2))*pow(-R - (l*rinz)/2. + riz,2))/rinz +
+               (A_1*(1 - pow(rinz,2))*sqrt(1 - (-(l*rinz)/2. + riz)/R)*R)/(rinz);   // Modified the adhesion term here
+        // = ad_sphere + el_sphere + el_cylinder + ad_cylinder
+/*
+
+        F.nz -= -(A_2*l*M_PI*rinz)*R/(2.) - (A_2*M_PI*(R + (l*rinz)/2. - riz))*R +
+                 (2*E_2*l*sqrt(R)*rinz*pow(R + (l*rinz)/2. - riz,1.5))/(3.) +
+                 (8*E_2*sqrt(R)*pow(R + (l*rinz)/2. - riz,2.5))/(15.) +
+                 (E_1*l*(1 - pow(rinz,2))*pow(-R - (l*rinz)/2. + riz,2))/(2.*rinz) +
+                 // (2*E_1*pow(-R - (l*rinz)/2. + riz,3))/3. +
+                 (E_1*(1 + pow(rinz,2))*pow(-R - (l*rinz)/2. + riz,3))/(3.*pow(rinz,2)) -
+                 (A_1*l*(1 - pow(rinz,2))*sqrt(1 - (-(l*rinz)/2. + riz)/R)*R)/(2.*rinz) +
+                 // (4*A_1*pow(1 - (-(l*rinz)/2. + riz)/R,1.5))/3. +
+                 (2*A_1*(1 + pow(rinz,2))*pow(1 - (-(l*rinz)/2. + riz)/R,1.5))*pow(R,1.5)/(3.*pow(rinz,2));
+             // modified A_1, A_2
+*/
+
+
+        //Original verision:
+        F.nz -= -(A_2*l*M_PI*rinz)/(2.*R) - (A_2*M_PI*(R + (l*rinz)/2. - riz))/R +
+                (2*E_2*l*sqrt(R)*rinz*pow(R + (l*rinz)/2. - riz,1.5))/3. +
+                (8*E_2*sqrt(R)*pow(R + (l*rinz)/2. - riz,2.5))/15. +
+                (E_1*l*(1 - pow(rinz,2))*pow(-R - (l*rinz)/2. + riz,2))/(2.*rinz) +
+                (2*E_1*pow(-R - (l*rinz)/2. + riz,3))/3. +
+                (E_1*(1 - pow(rinz,2))*pow(-R - (l*rinz)/2. + riz,3))/(3.*pow(rinz,2)) -
+                (A_1*l*(1 - pow(rinz,2))*sqrt(1 - (-(l*rinz)/2. + riz)/R)*R)/(2.*rinz) +
+                (4*A_1*pow(1 - (-(l*rinz)/2. + riz)/R,1.5))/3. +
+                (2*A_1*(1 - pow(rinz,2))*pow(1 - (-(l*rinz)/2. + riz)/R,1.5))/(3.*pow(rinz,2));
+
+    } else if (h1 > 0) { // *** Comment: should this be h2?
+        // Full contact
+        if (abs(t) < 1e-6) {
+            // linear version. Contact forces are linearized for small elevation angle
+            // to avoid numerical instabilities
+            F.z -= -2*E_1*l*R + (A_1*l)/(2.*pow(R,1.5)*sqrt(R - riz)) + 2*E_1*l*riz +
+                   pow(rinz,2)*(2*E_1*l*R + (A_1*pow(l,3))/(64.*pow(R,1.5)*pow(R - riz,2.5)) +
+                                (2*E_2*l*pow(R,2.5))/(3.*pow(R - riz,1.5)) - (A_1*l)/(2.*pow(R,1.5)*sqrt(R - riz)) -
+                                (8*E_2*l*pow(R,1.5))/(3.*sqrt(R - riz)) - 2*E_1*l*riz -
+                                (4*E_2*l*pow(R,1.5)*riz)/(3.*pow(R - riz,1.5)) + (8*E_2*l*sqrt(R)*riz)/(3.*sqrt(R - riz)) +
+                                (2*E_2*l*sqrt(R)*pow(riz,2))/(3.*pow(R - riz,1.5)));
+            F.nz -= 2*rinz*((E_1*pow(l,3))/12. - (A_2*l*M_PI)/R - E_1*l*pow(R,2) +
+                            (A_1*pow(l,3))/(96.*pow(R,1.5)*pow(R - riz,1.5)) + (4*E_2*l*pow(R,2.5))/(3.*sqrt(R - riz)) +
+                            (A_1*l*sqrt(R - riz))/pow(R,1.5) + 2*E_1*l*R*riz - (8*E_2*l*pow(R,1.5)*riz)/(3.*sqrt(R - riz)) -
+                            E_1*l*pow(riz,2) + (4*E_2*l*sqrt(R)*pow(riz,2))/(3.*sqrt(R - riz)));
+        } else {
+            // nonlinear version
+            // Original code:
+
+            F.z -= (E_1*l*(1 - pow(rinz,2))*(3*l*rinz + 6*(-R - (l*rinz)/2. + riz)))/3. -
+                   (2*A_1*(1 - pow(rinz,2))*(-(l*rinz)/(2.*sqrt(R - (l*rinz)/2. - riz)) + sqrt(R - (l*rinz)/2. - riz) -
+                                             sqrt(R + (l*rinz)/2. - riz) - (1/(2.*sqrt(R - (l*rinz)/2. - riz)) -
+                                                                            1/(2.*sqrt(R + (l*rinz)/2. - riz)))*(-R - (l*rinz)/2. + riz)))/(3.*pow(R,1.5)*rinz) -
+                   (8*E_2*sqrt(R)*rinz*(2*l*rinz*sqrt(R - (l*rinz)/2. - riz) -
+                                        2*(-sqrt(R - (l*rinz)/2. - riz) + sqrt(R + (l*rinz)/2. - riz))*(-R - (l*rinz)/2. + riz) -
+                                        (1/(2.*sqrt(R - (l*rinz)/2. - riz)) - 1/(2.*sqrt(R + (l*rinz)/2. - riz)))*
+                                        pow(-R - (l*rinz)/2. + riz,2) - (l*rinz*(-2*R + l*rinz + 2*(-(l*rinz)/2. + riz)))/
+                                                                        (2.*sqrt(R - (l*rinz)/2. - riz))))/15.;
+/*
+
+            F.z -= (E_1*l*(1 - pow(rinz,2))*2*(-R  + riz)) -
+                   (A_1*(1 - pow(rinz,2))*( sqrt(R - (l*rinz)/2. - riz) -  sqrt(R + (l*rinz)/2. - riz) ))/(rinz) -
+                   (4*E_2*sqrt(R)*rinz*(pow(R + (l*rinz)/2. - riz,1.5) - pow(R - (l*rinz)/2. - riz,1.5)))/3.;
+*/
+
+            // Original code:
+            F.nz -= (-2*A_2*l*M_PI*rinz)/R - (2*A_1*(1 - pow(rinz,2))*
+                                              ((l*(-sqrt(R - (l*rinz)/2. - riz) + sqrt(R + (l*rinz)/2. - riz)))/2. -
+                                               (pow(l,2)*rinz)/(4.*sqrt(R - (l*rinz)/2. - riz)) + l*sqrt(R - (l*rinz)/2. - riz) -
+                                               (l/(4.*sqrt(R - (l*rinz)/2. - riz)) + l/(4.*sqrt(R + (l*rinz)/2. - riz)))*(-R - (l*rinz)/2. + riz)))/
+                                             (3.*pow(R,1.5)*rinz) + (4*A_1*(l*rinz*sqrt(R - (l*rinz)/2. - riz) -
+                                                                            (-sqrt(R - (l*rinz)/2. - riz) + sqrt(R + (l*rinz)/2. - riz))*(-R - (l*rinz)/2. + riz)))/
+                                                                    (3.*pow(R,1.5)) + (2*A_1*(1 - pow(rinz,2))*
+                                                                                       (l*rinz*sqrt(R - (l*rinz)/2. - riz) - (-sqrt(R - (l*rinz)/2. - riz) + sqrt(R + (l*rinz)/2. - riz))*
+                                                                                                                             (-R - (l*rinz)/2. + riz)))/(3.*pow(R,1.5)*pow(rinz,2)) -
+                    (8*E_2*sqrt(R)*rinz*(l*(-sqrt(R - (l*rinz)/2. - riz) + sqrt(R + (l*rinz)/2. - riz))*
+                                         (-R - (l*rinz)/2. + riz) - (l/(4.*sqrt(R - (l*rinz)/2. - riz)) + l/(4.*sqrt(R + (l*rinz)/2. - riz)))*
+                                                                    pow(-R - (l*rinz)/2. + riz,2) - (pow(l,2)*rinz*(-2*R + l*rinz + 2*(-(l*rinz)/2. + riz)))/
+                                                                                                    (4.*sqrt(R - (l*rinz)/2. - riz)) + l*sqrt(R - (l*rinz)/2. - riz)*
+                                                                                                                                       (-2*R + l*rinz + 2*(-(l*rinz)/2. + riz))))/15. -
+                    (8*E_2*sqrt(R)*(-((-sqrt(R - (l*rinz)/2. - riz) + sqrt(R + (l*rinz)/2. - riz))*
+                                      pow(-R - (l*rinz)/2. + riz,2)) +
+                                    l*rinz*sqrt(R - (l*rinz)/2. - riz)*(-2*R + l*rinz + 2*(-(l*rinz)/2. + riz))))/15. +
+                    (E_1*l*(1 - pow(rinz,2))*(-(pow(l,2)*rinz)/2. - 3*l*(-R - (l*rinz)/2. + riz) +
+                                              l*(-3*R + l*rinz + 3*(-(l*rinz)/2. + riz))))/3. -
+                    (2*E_1*l*rinz*(3*pow(-R - (l*rinz)/2. + riz,2) + l*rinz*(-3*R + l*rinz + 3*(-(l*rinz)/2. + riz))))/3.;
+
+/*
+            F.nz -= ( -(E_1*l*rinz*(pow(l,2)*(-1 + 2*pow(rinz,2)) + 12*pow(R - riz,2)))/6. - 2*A_2*l*M_PI*rinz*R
+                               + (2*E_2*rinz*l*(pow(R - (l*rinz)/2. - riz,1.5) + pow(R + (l*rinz)/2. - riz,1.5))*sqrt(R))/3. +
+                               (8*E_2*(-pow(R - (l*rinz)/2. - riz,2.5) + pow(R + (l*rinz)/2. - riz,2.5))*sqrt(R))/15.
+                               + (-2*A_1*(1 - pow(rinz,2))*(sqrt(R - (l*rinz)/2. - riz) +
+                                                            sqrt(R + (l*rinz)/2. - riz))*l*sqrt(R))/(3.*rinz) +
+                               (2*A_1*(1 + pow(rinz,2))*(-pow(R - (l*rinz)/2. - riz,1.5) +
+                                                         pow(R + (l*rinz)/2. - riz,1.5))*sqrt(R))/(3.*pow(rinz,2))
+                             );
+*/
+        }
+
+    } else {
+        cout << "ERROR: Torque is below the ground!" << endl;
+        return F;
+    }
+
+    F.nz = check * F.nz;
+
+    return F;
+
+}
+
+int below_surface(Cell* cell_1) {
+    // Determine if the cell is below the ground
+
+    double t;
+
+    double nzi = cell_1->get_nz();
+    if (nzi < -1) {
+        nzi = -1;
+    }
+    if (nzi > 1) {
+        nzi = 1;
+    }
+
+    if (nzi > 0) {
+        t = asin(nzi);
+    } else {
+        t = asin(-nzi);
+    }
+
+    if (t == 0) {
+        t = 1e-10;
+    }
+
+    double l = cell_1->get_l();
+    double z = cell_1->get_z();
+
+    double h1 = z + l*nzi/2.0;
+    double h2 = z - l*nzi/2.0;
+
+    if (h1 > h2) {
+        h1 = h2;
+    }
+
+    if (h1 > R) {
+        // No contact
+        return 0;
+    } else if (h1 > (R - l*sin(t))) {
+        // Partial contact
+        return 0;
+    } else if (h1 > 0) {
+        // Full contact
+        return 0;
+    } else {
+        // Below ground
+//        cout << h1 << endl;
+        return 1;
+    }
+}
+
+int partial_contact(Cell* cell_1) {
+    // Determine if the cell is reorienting
+
+    double t;
+
+    double nzi = cell_1->get_nz();
+    if (nzi < -1) {
+        nzi = -1;
+    }
+    if (nzi > 1) {
+        nzi = 1;
+    }
+
+    if (nzi > 0) {
+        t = asin(nzi);
+    } else {
+        t = asin(-nzi);
+    }
+
+    if (t == 0) {
+        t = 1e-10;
+    }
+
+    double l = cell_1->get_l();
+    double z = cell_1->get_z();
+
+    double h1 = z + l*nzi/2.0;
+    double h2 = z - l*nzi/2.0;
+
+    if (h1 > h2) {
+        h1 = h2;
+    }
+
+    if (h1 > R) {
+        // No contact
+        return 1;
+    } else if (h1 > (R - l*sin(t))) {
+        // Partial contact
+        return 1;
+    } else if (h1 > 0) {
+        // Full contact
+        return 0;
+    } else {
+        // Below ground
+        return 0;
+    }
+}
+
+int cell_contact(Cell* cell_1) {
+    // Determine if the cell is in contact with the ground
+
+    double t;
+
+    double nzi = cell_1->get_nz();
+    if (nzi < -1) {
+        nzi = -1;
+    }
+    if (nzi > 1) {
+        nzi = 1;
+    }
+
+    if (nzi > 0) {
+        t = asin(nzi);
+    } else {
+        t = asin(-nzi);
+    }
+
+    if (t == 0) {
+        t = 1e-10;
+    }
+
+    double l = cell_1->get_l();
+    double z = cell_1->get_z();
+
+    double h1 = z + l*nzi/2.0;
+    double h2 = z - l*nzi/2.0;
+
+    if (h1 > h2) {
+        h1 = h2;
+    }
+
+    //cout << "h1: " << h1 << endl;
+
+    if (h1 > R) {
+        //cout << "h1 - R: " << h1 - R << endl;
+        // No contact
+        return 0;
+    } else if (h1 > (R - l*sin(t))) {
+        // Partial contact
+        return 1;
+    } else if (h1 > 0) {
+        // Full contact
+        return 1;
+    } else {
+        // Below ground
+        cout << "Error, below ground in cell contact?" << endl;
+        return 0;
+
+    }
+}
+
+double cell_h(Cell* cell_1) {
+    // Determine the height of the lower end of the cell
+
+    double t;
+
+    double nzi = cell_1->get_nz();
+    if (nzi < -1) {
+        nzi = -1;
+    }
+    if (nzi > 1) {
+        nzi = 1;
+    }
+
+    if (nzi > 0) {
+        t = asin(nzi);
+    } else {
+        t = asin(-nzi);
+    }
+
+    if (t == 0) {
+        t = 1e-10;
+    }
+
+    double l = cell_1->get_l();
+    double z = cell_1->get_z();
+
+    double h1 = z + l*nzi/2.0;
+    double h2 = z - l*nzi/2.0;
+
+    if (h1 > h2) {
+        h1 = h2;
+    }
+
+    //cout << "h1: " << h1 << endl;
+
+    return h1;
+
+}
+
+my6Vec net_gforce_elon(int i) {
+    // Returns the net force on each generalized coordinate of cell i from cell-cell and cell-surface interactions
+
+    my6Vec FF, Fi;
+    FF.x = 0;
+    FF.y = 0;
+    FF.z = 0;
+    FF.nx = 0;
+    FF.ny = 0;
+    FF.nz = 0;
+
+    for (int j = 0; j != cells.size(); j++) {
+        if (i != j) {
+            Fi = cell_cell_gforce(i, j);
+
+            FF.x += Fi.x;
+            FF.y += Fi.y;
+            FF.z += Fi.z;
+            FF.nx += Fi.nx;
+            FF.ny += Fi.ny;
+            FF.nz += Fi.nz;
+        }
+    }
+
+    // Calculate surface force:
+    Fi = cell_surface_gforce(cells[i]);
+
+    FF.z += Fi.z;
+    FF.nz += Fi.nz;
+
+    if (xy == 1) {
+        FF.z = 0;
+        FF.nz = 0;
+    }
+    if (xz == 1) {
+        FF.y = 0;
+        FF.ny = 0;
+    }
+
+    return FF;
+}
+
+double net_gforce_mag(int i) {
+    // Returns the net force on each generalized coordinate of cell i from cell-cell and cell-surface interactions
+
+    my6Vec FF, Fi;
+    FF.x = 0;
+    FF.y = 0;
+    FF.z = 0;
+    FF.nx = 0;
+    FF.ny = 0;
+    FF.nz = 0;
+
+    double fmag = 0;
+
+    for (int j = 0; j != cells.size(); j++) {
+        if (i != j) {
+            Fi = cell_cell_gforce(i, j);
+
+            FF.x += Fi.x * Fi.x;
+            FF.y += Fi.y * Fi.y;
+
+            fmag += sqrt(Fi.x * Fi.x + Fi.y * Fi.y);
+        }
+    }
+
+    // Calculate surface force:
+    return fmag;
+}
+
+derivFunc get_derivs(double nxi, double nyi, double nzi, double l, double z, my6Vec F) {
+    // This function returns the rate of change of the cell coordinates, i.e. dq_i / dt
+    // The rate of change depends on the forces as well as the friction
+
+    derivFunc df;
+    df.xd = 0;
+    df.yd = 0;
+    df.zd = 0;
+    df.nxd = 0;
+    df.nyd = 0;
+
+    double Fx = F.x;
+    double Fy = F.y;
+    double Fz = F.z;
+    double Tx = F.nx;
+    double Ty = F.ny;
+    double Tz = F.nz;
+
+    double t;
+
+    if (nzi < -1) {
+        nzi = -1;
+    }
+    if (nzi > 1) {
+        nzi = 1;
+    }
+
+    int trip = 0;
+
+    if (nzi > 0) {
+        t = asin(nzi);
+    } else {
+        t = asin(-nzi);
+        nxi = -nxi;
+        nyi = -nyi;
+        nzi = -nzi;
+    }
+
+    double h1 = z + l*nzi/2.0;
+    double h2 = z - l*nzi/2.0;
+
+    if (h1 > h2) {
+        h1 = h2;
+    }
+
+    // Area constants
+    double B0, B1, B2;
+
+    if (h1 > R or 2*R - 2*z - l*sin(t) < 0) {
+        // No contact
+        B0 = 0;
+        B1 = 0;
+        B2 = 0;
+    } else if (h1 > (R - l*sin(t))) {
+        // Partial contact
+        B0 = (2*(pow(nxi,2) + pow(nyi,2))*pow(1 - h1/R,1.5))/(3.*nzi) + (nzi*M_PI*(-h1 + R))/R;
+        B1 = -(h1*M_PI) - (l*nzi*M_PI)/2. + (pow(h1,2)*M_PI)/(2.*R) + (h1*l*nzi*M_PI)/(2.*R) + (M_PI*R)/2. +
+             ((pow(nxi,2) + pow(nyi,2))*pow(1 - h1/R,1.5)*(-4*h1 - 5*l*nzi + 4*R))/(15.*pow(nzi,2));
+        B2 = -(M_PI*(h1 - R)*(4*pow(h1,2) + 6*h1*l*nzi + 3*pow(l,2)*pow(nzi,2) - 8*h1*R - 6*l*nzi*R + 4*pow(R,2)))/(12.*nzi*R) +
+             ((pow(nxi,2) + pow(nyi,2))*pow(1 - h1/R,1.5)*(32*pow(h1,2) + 56*h1*l*nzi + 35*pow(l,2)*pow(nzi,2) - 8*(8*h1 + 7*l*nzi)*R +
+                                                           32*pow(R,2)))/(210.*pow(nzi,3));
+    } else if (h1 > 0) {
+        // Full contact
+        if (abs(t) < 1e-6) {
+            // linearized version
+            B0 = l*(pow(nxi,2) + pow(nyi,2))*sqrt(R)*sqrt(R - z);
+            B1 = -(pow(l,3)*(pow(nxi,2) + pow(nyi,2))*nzi*sqrt(R))/(24.*sqrt(R - z));
+            B2 = (pow(l,3)*(pow(nxi,2) + pow(nyi,2))*sqrt(R)*sqrt(R - z))/12.;
+        } else {
+            // Nonlinear
+            B0 = l*pow(nzi,2)*M_PI*R + ((pow(nxi,2) + pow(nyi,2))*sqrt(R)*
+                                        (l*nzi*(sqrt(-(l*nzi) + 2*R - 2*z) + sqrt(l*nzi + 2*R - 2*z)) - 2*(sqrt(-(l*nzi) + 2*R - 2*z) - sqrt(l*nzi + 2*R - 2*z))*(R - z)))/
+                                       (3.*sqrt(2)*nzi);
+            B1 = ((pow(nxi,2) + pow(nyi,2))*sqrt(R)*(3*pow(l,2)*pow(nzi,2)*(sqrt(-(l*nzi) + 2*R - 2*z) - sqrt(l*nzi + 2*R - 2*z)) -
+                                                     2*l*nzi*(sqrt(-(l*nzi) + 2*R - 2*z) + sqrt(l*nzi + 2*R - 2*z))*(R - z) -
+                                                     8*(sqrt(-(l*nzi) + 2*R - 2*z) - sqrt(l*nzi + 2*R - 2*z))*pow(R - z,2)))/(30.*sqrt(2)*pow(nzi,2));
+            B2 = (pow(l,3)*pow(nzi,2)*M_PI*R)/12. + ((pow(nxi,2) + pow(nyi,2))*sqrt(R)*
+                                                     (15*pow(l,3)*pow(nzi,3)*(sqrt(-(l*nzi) + 2*R - 2*z) + sqrt(l*nzi + 2*R - 2*z)) -
+                                                      6*pow(l,2)*pow(nzi,2)*(sqrt(-(l*nzi) + 2*R - 2*z) - sqrt(l*nzi + 2*R - 2*z))*(R - z) -
+                                                      16*l*nzi*(sqrt(-(l*nzi) + 2*R - 2*z) + sqrt(l*nzi + 2*R - 2*z))*pow(R - z,2) -
+                                                      64*(sqrt(-(l*nzi) + 2*R - 2*z) - sqrt(l*nzi + 2*R - 2*z))*pow(R - z,3)))/(420.*sqrt(2)*pow(nzi,3));
+        }
+
+    } else {
+        cout << "ERROR: Cell is below the ground!" << endl;
+        //return answer;
+    }
+
+    df.xd = (12*(B1*NU_1*(pow(l,3)*nxi*nyi*NU_0*(l*(-(nyi*Tx) + nxi*Ty)*NU_0 - (B1*Fy*nxi + B0*nyi*Tx - B0*nxi*Ty)*NU_1) +
+                          12*nxi*nzi*(nzi*Tx - nxi*Tz)*(pow(B1,2)*pow(NU_1,2) - (l*NU_0 + B0*NU_1)*((pow(l,3)*NU_0)/12. + B2*NU_1))) +
+                 Fx*(pow(l,3)*nxi*pow(nyi,2)*NU_0*(l*NU_0 + B0*NU_1)*((pow(l,3)*NU_0)/12. + B2*NU_1) -
+                     nxi*(pow(l,3)*(pow(nxi,2) + pow(nzi,2))*NU_0 + 12*B2*pow(nzi,2)*NU_1)*
+                     (pow(B1,2)*pow(NU_1,2) - (l*NU_0 + B0*NU_1)*((pow(l,3)*NU_0)/12. + B2*NU_1)))))/
+            (nxi*(pow(l,4)*pow(NU_0,2) + 12*B2*l*NU_0*NU_1 + B0*pow(l,3)*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(NU_1,2))*
+             (pow(l,4)*(pow(nxi,2) + pow(nyi,2) + pow(nzi,2))*pow(NU_0,2) + 12*B2*l*pow(nzi,2)*NU_0*NU_1 +
+              B0*pow(l,3)*(pow(nxi,2) + pow(nyi,2) + pow(nzi,2))*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(nzi,2)*pow(NU_1,2)));
+    df.yd = (-12*B1*NU_1*(pow(l,4)*(-(nxi*nyi*Tx) + pow(nxi,2)*Ty + nzi*(nzi*Ty - nyi*Tz))*pow(NU_0,2) + 12*B2*l*nzi*(nzi*Ty - nyi*Tz)*NU_0*NU_1 +
+                          pow(l,3)*(B1*Fx*nxi*nyi + B0*(-(nxi*nyi*Tx) + pow(nxi,2)*Ty + nzi*(nzi*Ty - nyi*Tz)))*NU_0*NU_1 +
+                          12*(pow(B1,2) - B0*B2)*nzi*(-(nzi*Ty) + nyi*Tz)*pow(NU_1,2)) +
+             Fy*(pow(l,7)*pow(NU_0,3) + B0*pow(l,6)*pow(NU_0,2)*NU_1 +
+                 12*B2*pow(l,4)*(pow(nxi,2) + pow(nyi,2) + 2*pow(nzi,2))*pow(NU_0,2)*NU_1 +
+                 144*pow(B2,2)*l*pow(nzi,2)*NU_0*pow(NU_1,2) +
+                 12*pow(l,3)*(-(pow(B1,2)*(pow(nyi,2) + pow(nzi,2))) + B0*B2*(pow(nxi,2) + pow(nyi,2) + 2*pow(nzi,2)))*NU_0*
+                 pow(NU_1,2) + 144*B2*(-pow(B1,2) + B0*B2)*pow(nzi,2)*pow(NU_1,3)))/
+            ((pow(l,4)*pow(NU_0,2) + 12*B2*l*NU_0*NU_1 + B0*pow(l,3)*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(NU_1,2))*
+             (pow(l,4)*pow(NU_0,2) + B0*pow(l,3)*NU_0*NU_1 + 12*B2*l*pow(nzi,2)*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(nzi,2)*pow(NU_1,2)));
+    df.zd = Fz/(l*NU_0);
+    df.nxd = (12*(pow(l,5)*(pow(nyi,2)*Tx - nxi*nyi*Ty + nzi*(nzi*Tx - nxi*Tz))*pow(NU_0,3) +
+                  12*B2*pow(l,2)*nzi*(nzi*Tx - nxi*Tz)*pow(NU_0,2)*NU_1 +
+                  pow(l,4)*(B1*(Fy*nxi*nyi - Fx*(pow(nyi,2) + pow(nzi,2))) + 2*B0*(pow(nyi,2)*Tx - nxi*nyi*Ty + nzi*(nzi*Tx - nxi*Tz)))*
+                  pow(NU_0,2)*NU_1 + 12*l*nzi*(-(nzi*(B1*B2*Fx + pow(B1,2)*Tx - 2*B0*B2*Tx)) + (pow(B1,2) - 2*B0*B2)*nxi*Tz)*NU_0*pow(NU_1,2) -
+                  B0*pow(l,3)*(B1*(-(Fy*nxi*nyi) + Fx*(pow(nyi,2) + pow(nzi,2))) +
+                               B0*(-(pow(nyi,2)*Tx) + nxi*nyi*Ty + nzi*(-(nzi*Tx) + nxi*Tz)))*NU_0*pow(NU_1,2) +
+                  12*(pow(B1,2) - B0*B2)*nzi*(B1*Fx*nzi - B0*nzi*Tx + B0*nxi*Tz)*pow(NU_1,3)))/
+             ((pow(l,4)*pow(NU_0,2) + 12*B2*l*NU_0*NU_1 + B0*pow(l,3)*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(NU_1,2))*
+              (pow(l,4)*pow(NU_0,2) + B0*pow(l,3)*NU_0*NU_1 + 12*B2*l*pow(nzi,2)*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(nzi,2)*pow(NU_1,2)));
+    df.nyd = (12*(pow(l,5)*(-(nxi*nyi*Tx) + pow(nxi,2)*Ty + nzi*(nzi*Ty - nyi*Tz))*pow(NU_0,3) +
+                  12*B2*pow(l,2)*nzi*(nzi*Ty - nyi*Tz)*pow(NU_0,2)*NU_1 -
+                  pow(l,4)*(B1*(-(Fx*nxi*nyi) + Fy*(pow(nxi,2) + pow(nzi,2))) + 2*B0*(nxi*nyi*Tx - pow(nxi,2)*Ty + nzi*(-(nzi*Ty) + nyi*Tz)))*
+                  pow(NU_0,2)*NU_1 + 12*l*nzi*(-(nzi*(B1*B2*Fy + pow(B1,2)*Ty - 2*B0*B2*Ty)) + (pow(B1,2) - 2*B0*B2)*nyi*Tz)*NU_0*pow(NU_1,2) +
+                  B0*pow(l,3)*(B1*(Fx*nxi*nyi - Fy*(pow(nxi,2) + pow(nzi,2))) + B0*(-(nxi*nyi*Tx) + pow(nxi,2)*Ty + nzi*(nzi*Ty - nyi*Tz)))*NU_0*
+                  pow(NU_1,2) + 12*(pow(B1,2) - B0*B2)*nzi*(B1*Fy*nzi - B0*nzi*Ty + B0*nyi*Tz)*pow(NU_1,3)))/
+             ((pow(l,4)*pow(NU_0,2) + 12*B2*l*NU_0*NU_1 + B0*pow(l,3)*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(NU_1,2))*
+              (pow(l,4)*pow(NU_0,2) + B0*pow(l,3)*NU_0*NU_1 + 12*B2*l*pow(nzi,2)*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(nzi,2)*pow(NU_1,2)));
+
+    df.nzd = (-12*(l*(nxi*nzi*Tx + nyi*nzi*Ty + (-1 + pow(nzi,2))*Tz)*NU_0 +
+                   (-(B1*(Fx*nxi + Fy*nyi)*nzi) + B0*(nxi*nzi*Tx + nyi*nzi*Ty + (-1 + pow(nzi,2))*Tz))*NU_1))/
+             (pow(l,4)*pow(NU_0,2) + B0*pow(l,3)*NU_0*NU_1 + 12*B2*l*pow(nzi,2)*NU_0*NU_1 - 12*(pow(B1,2) - B0*B2)*pow(nzi,2)*pow(NU_1,2));
+
+    return df;
+}
+
+int grow_func (double t, const double y[], double f[], void *params) {
+    (void)(t);
+
+    // Calculate the rhs of the differential equation, dy/dt = ?
+
+    // The degrees of freedom are as follows:
+    // f[0] = cell 1, x pos
+    // f[1] = cell 1, y pos
+    // f[2] = cell 1, z pos
+    // f[3] = cell 1, nx
+    // f[4] = cell 1, ny
+    // f[5] = cell 1, nz
+    // f[6] = length
+    // f[7] cell 2, x pos...
+
+    double tx, ty, tz, t_net, nx1, ny1, nz1, nx2, ny2, nz2, l, d, tnz, tn;
+    double dx, dy, dz;
+
+    double norm;
+
+    double ai;
+
+    my6Vec F, noise;
+
+    derivFunc df, df2;
+
+    double fx, fy, fz;
+    double wx, wy, wz;
+
+    int confine;
+
+    // Calculate the force on cell i
+    // *** Step 1: update the cell
+    int dof = 0;
+    int i = 0;
+    while (i < cells.size()) {
+        if (i >= cells.size()) {
+            f[dof] = 0;
+            dof = dof + 1;
+
+
+        } // *** Comment: will this if sentence ever be executed?? -> actually not...
+        else {
+
+            nx1 = y[dof+3];
+            ny1 = y[dof+4];
+            nz1 = y[dof+5];
+            norm = vnorm(nx1, ny1, nz1);
+            nx1 = nx1/norm;
+            ny1 = ny1/norm;
+            nz1 = nz1/norm;
+
+            l = y[dof+6];
+
+            cells[i]->set_pos(y[dof], y[dof+1], y[dof+2]);
+            cells[i]->set_n(nx1, ny1, nz1);
+            cells[i]->set_l(l);
+
+            i++;
+            dof = dof + DOF_GROW;
+        }
+    }
+
+    // *** Step 2: Calculate the force on cell i
+    // *** This is actually very dangerous, but it works because the force f[] initialize as zeros from the start
+    // and when cells.size does not change then since we only edit the values for i < cells.size(), the latter
+    // remains to be zero; and when cells.size change we did reset the solver in the simple growth function...
+    dof = 0;
+    i = 0;
+    while (i < cells.size()) {
+        if (i >= cells.size()) {
+            f[dof] = 0;
+            dof = dof + 1;
+        }
+        else {
+
+            nx1 = y[dof+3];
+            ny1 = y[dof+4];
+            nz1 = y[dof+5];
+            norm = vnorm(nx1, ny1, nz1);
+            nx1 = nx1/norm;
+            ny1 = ny1/norm;
+            nz1 = nz1/norm;
+
+            l = y[dof+6];
+
+            confine = cells[i]->get_confine();
+
+            if (below_surface(cells[i]) == 1) {
+                return GSL_EBADFUNC;
+            }
+
+            F = net_gforce_elon(i);
+            noise = cells[i]->get_noise();
+
+            dx = noise.x;
+            dy = noise.y;
+            dz = noise.z;
+            dx = 0;
+            dy = 0;
+            dz = 0;
+
+            if (xy == 1 or confine == 1) {
+                dz = 0;
+                F.z = 0;
+            }
+            if (xz == 1) {
+                dy = 0;
+                F.y = 0;
+            }
+
+            F.x = F.x + dx;
+            F.y = F.y + dy;
+            F.z = F.z + dz;
+
+//            F.x = F.x * (1 + dx);
+//            F.y = F.y * (1 + dy);
+//            F.z = F.z * (1 + dz);
+
+            dx = noise.nx;
+            dy = noise.ny;
+            dz = noise.nz;
+
+            if (xy == 1 or confine == 1) {
+                dz = 0;
+                F.nz = 0;
+            }
+            if (xz == 1) {
+                dy = 0;
+                F.ny = 0;
+            }
+
+            F.nx = F.nx + dx;
+            F.ny = F.ny + dy;
+            F.nz = F.nz + dz;
+
+//            F.nx = F.nx * (1 + dx);
+//            F.ny = F.ny * (1 + dy);
+//            F.nz = F.nz * (1 + dz);
+
+            df = get_derivs(nx1, ny1, nz1, l, y[dof+2], F);
+
+
+            f[dof+0] = df.xd;
+            f[dof+1] = df.yd;
+            f[dof+2] = df.zd;
+            f[dof+3] = df.nxd;
+            f[dof+4] = df.nyd;
+            f[dof+5] = df.nzd;
+
+            ai = cells[i]->get_ai();
+
+            f[dof+6] = ai * (l + (4*R)/3.);
+
+            i++;
+            dof = dof + DOF_GROW;
+        }
+    }
+
+    return GSL_SUCCESS;
+
+}
+
+double simple_grow(double tf, ofstream &myfile) {
+    // Evolve the system as each cell grows by elongation.
+    double y[MAX_DOF];
+
+    cout << "Growing" << endl;
+
+    unsigned long dim = MAX_DOF;
+
+    // Different choices of the integration routine.
+    //const gsl_odeiv_step_type * TT = gsl_odeiv_step_rk8pd;
+    //const gsl_odeiv_step_type * TT = gsl_odeiv_step_rk4;
+    const gsl_odeiv_step_type * TT = gsl_odeiv_step_rkf45;
+
+    gsl_odeiv_step * s = gsl_odeiv_step_alloc (TT, dim);
+    gsl_odeiv_control * c = gsl_odeiv_control_y_new (h0, 0);
+    gsl_odeiv_evolve * e = gsl_odeiv_evolve_alloc (dim);
+
+    gsl_odeiv_system sys = {grow_func, NULL, dim, NULL};
+
+    double l_m, l_d, dx, dy, dz;
+    int confine;
+
+    int reset = 1;
+    int dof;
+    int k;
+
+    double t = 0.0, tcurrent = tstep;
+    double t_last = 0.0;
+    double h = h0;
+
+    int alpha_trip = 0;
+
+    double fmag;
+    my6Vec F;
+
+    double nnorm;
+
+    double nz_0, nz_1;
+    int sa0, sa1;
+    overlapVec nij,nij1,nij2;
+    int temp,check,current_size;
+    string typei,typej;
+    double distTHRESH;
+
+
+    // Evolve the differential equation
+    while (t < tf) {
+
+        cout << t << endl;
+
+        // Evolve until time step to output data
+        while (t < tcurrent) {
+
+            if (reset == 1) {
+                // Set initial conditions
+                dof = 0;
+                k = 0;
+
+                while (k < cells.size()) {
+                    if (k >= cells.size()) {
+                        y[dof] = 0;
+                        dof = dof + 1;
+                    } else {
+                        y[dof+0] = cells[k]->get_x();
+                        y[dof+1] = cells[k]->get_y();
+                        y[dof+2] = cells[k]->get_z();
+                        y[dof+3] = cells[k]->get_nx();
+                        y[dof+4] = cells[k]->get_ny();
+                        y[dof+5] = cells[k]->get_nz();
+                        y[dof+6] = cells[k]->get_l();
+
+
+                        k++;
+                        dof = dof + DOF_GROW;
+                    }
+
+                }
+
+            }
+
+            reset = 0;
+
+            // Evolve the system by an adaptive step size, initial choice "h"
+            // Note: This line is calling GSL solver to evolve one time step of the system
+            // Special Note: In C++, the ADDRESS instead of values of the array is passed to a function, thus any function
+            // calling for array y can update the value of y in time.
+            int status = gsl_odeiv_evolve_apply (e, c, s, &sys, &t, tcurrent, &h, y);
+            cout << t << endl;
+            if( t - t_last < TIME_EPS)
+            {
+                cout << "Error: unlikely to converge in the solver!" << endl;
+                exit(EXIT_FAILURE);
+            }
+            t_last = t;
+
+
+            // Set the coordinates after each step
+            dof = 0;
+            fmag = 0;
+            for (int j = 0; j != cells.size(); j++) {
+
+                cells[j]->set_noise();
+
+                if (xz == 1) {
+                    y[dof+4] = 0;
+                }
+
+
+                if (xy == 1) {
+                    y[dof+5] = 0;
+                }
+
+                nnorm = vnorm(y[dof+3],y[dof+4],y[dof+5]);
+
+                y[dof+3] = y[dof+3]/nnorm;
+                y[dof+4] = y[dof+4]/nnorm;
+                y[dof+5] = y[dof+5]/nnorm;
+
+                cells[j]->set_pos(y[dof], y[dof+1], y[dof+2]);
+                cells[j]->set_n(y[dof+3], y[dof+4], y[dof+5]);
+                cells[j]->set_l(y[dof+6]);
+
+                // *** Question: what are these for???
+                nz_0 = cells[j]->get_current_nz();
+                sa0 = cells[j]->get_current_sa();
+
+                nz_1 = cells[j]->get_nz();
+                sa1 = cell_contact(cells[j]);
+
+                cells[j]->set_current_nz(y[dof+5]);
+                cells[j]->set_current_sa(sa1);
+
+                dof = dof + DOF_GROW;
+            }
+
+            if (status != GSL_SUCCESS) {
+                reset = 1;
+
+                gsl_odeiv_step_reset(s);
+                gsl_odeiv_evolve_reset (e);
+                h = h/2.;
+
+//                cout << "This line is working!" << endl;
+//
+//                if( h < dtTHRESH)
+//                {
+//                    cout << "Current time step is " << h <<endl;
+//                }
+
+            } else {
+
+                // update the contactlist
+                for(int kk = 0; kk < cells.size(); kk++)
+                {
+                    // loop over the contactlist of kk, and delete those larger than 0 or dc_JKR
+                    for(int i=0; i < cells[kk]->get_size_contactlist(); i++)
+                    {
+                        temp = cells[kk]->get_contactlist_ele(i);
+
+                        typei = cells[kk]->get_lin(); typej = cells[temp]->get_lin();
+                        if (typei[1] == 'A' or typej[1] == 'A')
+                        {distTHRESH = 0.;}else {distTHRESH = dc_JKR;}
+
+                        nij = get_overlap_Struct(cells[kk],cells[temp]);
+                        if(nij.dist - 2*R> distTHRESH)
+                        {cells[kk]->erase_contactlist_ele(i); i = i - 1;}
+                    }
+
+                    // loop over all cells, and add cells with dij<0 to the list
+                    for(int nn=0; nn < cells.size(); nn++)
+                    {
+                        if(nn == kk){continue;}
+                        nij = get_overlap_Struct(cells[kk],cells[nn]);
+                        if(nij.dist < 2*R and cells[kk]->is_in_contactlist(nn)!=1)
+                        {cells[kk]->add_contactlist(nn);}
+                    }
+                }
+
+                //reset = 0;
+                k = 0;
+                dof = 0;
+                temp = 0;
+                current_size = cells.size();
+
+                // Divide cells that are long enough (l_i > l_f)
+                while (k < current_size) {
+                    if (y[dof+6] > cells[k]->get_Lf()) {
+
+                        l_m = y[dof+6];    // mother length
+                        l_d = (l_m + 2*R)/2.0 - 2*R;    // daughter length
+
+                        if (xz == 1) {
+                            y[dof+4] = 0;
+                        }
+
+                        if (xy == 1) {
+                            y[dof+5] = 0;
+                        }
+
+                        dx = ((l_m + 2*R) / 4.0) * y[dof+3];
+                        dy = ((l_m + 2*R) / 4.0) * y[dof+4];
+                        dz = ((l_m + 2*R) / 4.0) * y[dof+5];
+
+                        confine = cells[k]->get_confine();
+
+                        Cell* c1 = new Cell(y[dof]+dx, y[dof+1]+dy, y[dof+2]+dz, y[dof+3], y[dof+4], y[dof+5], l_d);
+                        Cell* c2 = new Cell(y[dof]-dx, y[dof+1]-dy, y[dof+2]-dz, y[dof+3], y[dof+4], y[dof+5], l_d);
+
+                        c1->set_tborn(t);
+                        c2->set_tborn(t);
+
+                        c1->set_lin(cells[k]->get_lin());
+                        c1->set_lin("0");
+                        c2->set_lin(cells[k]->get_lin());
+                        c2->set_lin("1");
+
+                        if (confine == 1) {
+                            c1->set_confine();
+                            c2->set_confine();
+                        }
+
+                        c1->set_current_nz(y[dof+5]);
+                        c1->set_current_sa( cell_contact(c1) );
+                        c2->set_current_nz(y[dof+5]);
+                        c2->set_current_sa( cell_contact(c2) );
+
+                        for(int i = 0; i < cells[k]->get_size_contactlist(); i++)
+                        {
+                            temp = cells[k]->get_contactlist_ele(i);
+                            nij1 = get_overlap_Struct(cells[temp],c1); nij2 = get_overlap_Struct(cells[temp],c2);
+                            if( nij1.dist < nij2.dist)
+                            {
+                                c1->add_contactlist(temp); // add temp to c1's ContactList;
+                                // Note: we will add the c1 at k, so no need to handle cells[temp]
+                            }
+                            else{
+                                c2->add_contactlist(temp); // add temp to c2's ContactList;
+                                // replace the original k in the contactlist of cells[temp] with new index
+                                check = cells[temp]->replace_contactlist_ele(k,cells.size());
+                                if (!check) {cout<<"Error in contactlist!"<<endl;}
+                            }
+                        }
+                        c1->add_contactlist(cells.size()); c2->add_contactlist(k); // by default the two daughter cells are in contact
+
+                        delete cells[k];
+                        cells.erase(cells.begin()+k, cells.begin()+k+1);
+/*
+
+                        // delete all the cells that are not in contact with the surface
+                        int kk = 0;
+                        if ( cell_contact(c1) == 1 ) {
+                            cells.insert(cells.begin()+k, c1);
+                            kk = kk + 1;
+
+                        } else {
+                            delete c1;
+                        }
+                        if ( cell_contact(c2) == 1 ) {
+                            cells.insert(cells.begin()+k, c2);
+
+                            kk = kk + 1;
+                        } else {
+
+                            delete c2;
+                        }
+
+                        k = k - 1 + kk;
+*/
+
+                        // leave all the cells as they are
+                        cells.insert(cells.begin()+k, c1);
+                        cells.insert(cells.begin()+cells.size(), c2);
+                        // k = k + 1;
+
+                        // *** Question: can this chunk be moved our of the cycle? i.e. after
+                        // determining cell division -> then reset solver
+
+                        gsl_odeiv_step_reset(s);
+                        gsl_odeiv_evolve_reset (e);
+
+                        gsl_odeiv_evolve_free (e);
+                        gsl_odeiv_control_free (c);
+                        gsl_odeiv_step_free (s);
+
+                        h = h0;
+
+                        s = gsl_odeiv_step_alloc (TT, dim);
+                        c = gsl_odeiv_control_y_new (h0, 0);
+                        e = gsl_odeiv_evolve_alloc (dim);
+
+                        gsl_odeiv_system sys = {grow_func, NULL, dim, NULL};
+
+                        reset = 1;
+
+                    }
+                    k++;
+                    dof = dof + DOF_GROW;
+                }
+
+            }
+        }
+
+
+        // Output the data
+        int numcell = cells.size();
+        myfile << t << " " << numcell << endl;
+
+        dof = 0;
+        double nz2 = 0;
+        double nz_sum = 0;
+
+        int v_sum = 0;
+        my6Vec FF;
+
+        for (int j = 0; j != cells.size(); j++) {
+
+            FF = net_gforce_elon(j);
+            myfile << cells[j]->get_x() << " " << cells[j]->get_y() << " " << cells[j]->get_z() << " "
+                   << cells[j]->get_nx() << " " << cells[j]->get_ny() << " " << cells[j]->get_nz() << " "
+                   << cells[j]->get_l() << " " << cells[j]->get_ai() << " " << cell_contact(cells[j]) << " " << net_gforce_mag(j) << " " << FF.x << " " << FF.y << " " << cells[j]->get_lin() << endl;
+            dof = dof + DOF_GROW;
+
+        }
+
+        tcurrent = tcurrent + tstep;
+    }
+
+    gsl_odeiv_evolve_free (e);
+    gsl_odeiv_control_free (c);
+    gsl_odeiv_step_free (s);
+
+    return t;
+}
+
+// *************************** //
+
+#endif //BIOFILM_AGENT_AGENT_V2_H
